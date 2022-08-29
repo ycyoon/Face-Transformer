@@ -19,29 +19,107 @@ from IPython import embed
 from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
 
+from torchvision.datasets import ImageFolder
 
-def need_save(acc, highest_acc):
-    do_save = False
-    save_cnt = 0
-    if acc[0] > 0.98:
-        do_save = True
-    for i, accuracy in enumerate(acc):
-        if accuracy > highest_acc[i]:
-            highest_acc[i] = accuracy
-            do_save = True
-        if i > 0 and accuracy >= highest_acc[i]-0.002:
-            save_cnt += 1
-    if save_cnt >= len(acc)*3/4 and acc[0]>0.99:
-        do_save = True
-    print("highest_acc:", highest_acc)
-    return do_save
+import shutil
 
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self, name, fmt=':f'):
+        self.name = name
+        self.fmt = fmt
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def __str__(self):
+        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        return fmtstr.format(**self.__dict__)
+
+
+class ProgressMeter(object):
+    def __init__(self, num_batches, *meters, prefix=""):
+        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
+        self.meters = meters
+        self.prefix = prefix
+
+    def print(self, batch):
+        entries = [self.prefix + self.batch_fmtstr.format(batch)]
+        entries += [str(meter) for meter in self.meters]
+        print('\t'.join(entries))
+
+    def _get_batch_fmtstr(self, num_batches):
+        num_digits = len(str(num_batches // 1))
+        fmt = '{:' + str(num_digits) + 'd}'
+        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
+
+def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, 'model_best.pth.tar')
+
+def validate(val_loader, model, criterion):
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+
+    # switch to evaluate mode
+    model.eval()
+
+    with torch.no_grad():
+        for i, (images, target) in enumerate(val_loader):            
+            
+            # compute output
+            output = model(images)
+            target = target.to('cuda')
+            loss = criterion(output, target)
+
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
+  
+            if i % 10 == 0:
+                print('val Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+                    .format(top1=top1, top5=top5))
+
+    return top1.avg
+
+def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, 'model_best.pth.tar')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='for face verification')
     parser.add_argument("-w", "--workers_id", help="gpu ids or cpu", default='cpu', type=str)
     parser.add_argument("-e", "--epochs", help="training epochs", default=125, type=int)
-    parser.add_argument("-b", "--batch_size", help="batch_size", default=256, type=int)
+    parser.add_argument("-b", "--batch_size", help="batch_size", default=512, type=int)
     parser.add_argument("-d", "--data_mode", help="use which database, [casia, vgg, ms1m, retina, ms1mr]",default='ms1m', type=str)
     parser.add_argument("-n", "--net", help="which network, ['VIT','VITs']",default='VITs', type=str)
     parser.add_argument("-head", "--head", help="head type, ['Softmax', 'ArcFace', 'CosFace', 'SFaceLoss']", default='ArcFace', type=str)
@@ -110,7 +188,6 @@ if __name__ == '__main__':
     MULTI_GPU = cfg['MULTI_GPU'] # flag to use multiple GPUs
     GPU_ID = cfg['GPU_ID'] # specify your GPU ids
     print('GPU_ID', GPU_ID)
-    TARGET = cfg['TARGET']
     print("=" * 60)
     print("Overall Configurations:")
     print(cfg)
@@ -121,17 +198,34 @@ if __name__ == '__main__':
     writer = SummaryWriter(WORK_PATH) # writer for buffering intermedium results
     torch.backends.cudnn.benchmark = True
 
-    with open(os.path.join(DATA_ROOT, 'property'), 'r') as f:
-        NUM_CLASS, h, w = [int(i) for i in f.read().split(',')]
-    assert h == INPUT_SIZE[0] and w == INPUT_SIZE[1]
+    #with open(os.path.join(DATA_ROOT, 'property'), 'r') as f:
+    #    NUM_CLASS, h, w = [int(i) for i in f.read().split(',')]
+    #assert h == INPUT_SIZE[0] and w == INPUT_SIZE[1]
 
-    dataset = FaceDataset(os.path.join(DATA_ROOT, 'train.rec'), rand_mirror=True)
-    trainloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=len(GPU_ID), drop_last=True)
+    transform_dict = {
+        'src': transforms.Compose(
+        [transforms.Resize((112, 112)),
+        transforms.RandomHorizontalFlip(),
+         transforms.ToTensor(),
+         transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                              std=[0.229, 0.224, 0.225]),
+         ]),
+        'tar': transforms.Compose(
+        [transforms.Resize((112, 112)),
+         transforms.ToTensor(),
+         transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                              std=[0.229, 0.224, 0.225]),
+         ])}
 
+    #dataset = FaceDataset(os.path.join(DATA_ROOT, 'train.rec'), rand_mirror=True)
+    datasets = {}
+    datasets['train'] = ImageFolder(os.path.join(DATA_ROOT,'train'), transform=transform_dict['src'])
+    datasets['test'] = ImageFolder(os.path.join(DATA_ROOT,'test'), transform=transform_dict['tar'])
+    NUM_CLASS = len(datasets['train'].classes)
+    trainloader = torch.utils.data.DataLoader(datasets['train'], batch_size=BATCH_SIZE, shuffle=True, num_workers=len(GPU_ID), drop_last=True)
+    testloader  = torch.utils.data.DataLoader(datasets['test'], batch_size=BATCH_SIZE, shuffle=True, num_workers=len(GPU_ID), drop_last=True)
     print("Number of Training Classes: {}".format(NUM_CLASS))
 
-    vers = get_val_data(EVAL_PATH, TARGET)
-    highest_acc = [0.0 for t in TARGET]
 
     #embed()
     #======= model & loss & optimizer =======#
@@ -200,21 +294,20 @@ if __name__ == '__main__':
 
     #======= train & validation & save checkpoint =======#
     DISP_FREQ = 10 # frequency to display training loss & acc
-    VER_FREQ = 20
+    VER_FREQ = 100
 
     batch = 0  # batch index
 
-    losses = AverageMeter()
-    top1 = AverageMeter()
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    best_acc = 0
 
-
-    BACKBONE.train()  # set to training mode
     for epoch in range(NUM_EPOCH): # start training process
         
         lr_scheduler.step(epoch)
 
         last_time = time.time()
-
+        BACKBONE.train()  # set to training mode
         for inputs, labels in iter(trainloader):
 
             # compute output
@@ -226,10 +319,11 @@ if __name__ == '__main__':
 
             #print("outputs", outputs, outputs.data)
             # measure accuracy and record loss
-            prec1= train_accuracy(outputs.data, labels, topk = (1,))
+            #prec1= train_accuracy(outputs.data, labels, topk = (1,))
+            prec1, prec5 = accuracy(outputs.data, labels, topk = (1,5))
 
             losses.update(loss.data.item(), inputs.size(0))
-            top1.update(prec1.data.item(), inputs.size(0))
+            top1.update(prec1[0], inputs.size(0))
 
 
             # compute gradient and do SGD step
@@ -254,31 +348,20 @@ if __name__ == '__main__':
                     epoch + 1, batch + 1, speed=inputs.size(0) * DISP_FREQ / float(batch_time),
                     loss=losses, top1=top1))
                 #print("=" * 60)
-                losses = AverageMeter()
-                top1 = AverageMeter()
+                losses = AverageMeter('Loss', ':.4e')
+                top1 = AverageMeter('Acc@1', ':6.2f')
 
             if ((batch + 1) % VER_FREQ == 0) and batch != 0: #perform validation & save checkpoints (buffer for visualization)
                 for params in OPTIMIZER.param_groups:
                     lr = params['lr']
                     break
                 print("Learning rate %f"%lr)
-                print("Perform Evaluation on", TARGET, ", and Save Checkpoints...")
-                acc = []
-                for ver in vers:
-                    name, data_set, issame = ver
-                    accuracy, std, xnorm, best_threshold, roc_curve = perform_val(MULTI_GPU, DEVICE, EMBEDDING_SIZE, BATCH_SIZE, BACKBONE, data_set, issame)
-                    buffer_val(writer, name, accuracy, std, xnorm, best_threshold, roc_curve, batch + 1)
-                    print('[%s][%d]XNorm: %1.5f' % (name, batch+1, xnorm))
-                    print('[%s][%d]Accuracy-Flip: %1.5f+-%1.5f' % (name, batch+1, accuracy, std))
-                    print('[%s][%d]Best-Threshold: %1.5f' % (name, batch+1, best_threshold))
-                    acc.append(accuracy)
-
-                # save checkpoints per epoch
-                if need_save(acc, highest_acc):
-                    if MULTI_GPU:
-                        torch.save(BACKBONE.module.state_dict(), os.path.join(WORK_PATH, "Backbone_{}_Epoch_{}_Batch_{}_Time_{}_checkpoint.pth".format(BACKBONE_NAME, epoch + 1, batch + 1, get_time())))
-                    else:
-                        torch.save(BACKBONE.state_dict(), os.path.join(WORK_PATH, "Backbone_{}_Epoch_{}_Batch_{}_Time_{}_checkpoint.pth".format(BACKBONE_NAME, epoch + 1, batch + 1, get_time())))
+                
+                acc = validate(testloader, BACKBONE, LOSS)
+                if acc > best_acc:
+                    print("Save Checkpoints...")
+                    save_checkpoint(BACKBONE, True), '%d_%f.pth.tar' % (epoch, acc)
+                    best_acc = acc
                 BACKBONE.train()  # set to training mode
 
             batch += 1 # batch index
