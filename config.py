@@ -31,7 +31,7 @@ def get_config(args):
     if args.data_mode == 'retina':
         configuration['DATA_ROOT'] = './Data/ms1m-retinaface-t1/'
     elif args.data_mode == 'vgg':
-        configuration['DATA_ROOT'] = '/home/yoon/data/face/VGG-Face2/data'
+        configuration['DATA_ROOT'] = '/home/yoon/data/face/VGG-Face2/face_extract'
     else:
         raise Exception(args.data_mode)
     configuration['EVAL_PATH'] = './eval/'
